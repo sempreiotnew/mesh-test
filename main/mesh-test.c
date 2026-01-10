@@ -12,22 +12,41 @@
 #define LED_GPIO GPIO_NUM_2
 static const char *TAG = "wifi_ap_web";
 
-// Simple HTML page
+static bool led_state = false; // LED off initially
+
+// HTML page with LED switch button
 static const char *HTML_PAGE = "<!DOCTYPE html>"
 "<html>"
 "<head><title>ESP32 AP</title></head>"
 "<body>"
-"<h1>Hello from ESP32!</h1>"
-"<p>This is a simple Wi-Fi AP page.</p>"
+"<h1>ESP32 LED Control</h1>"
+"<p>LED is currently: %s</p>"
+"<form method='POST' action='/led'>"
+"<input type='submit' value='Toggle LED'>"
+"</form>"
 "</body>"
 "</html>";
 
 // HTTP GET handler
 esp_err_t root_get_handler(httpd_req_t *req)
 {
-    gpio_set_level(LED_GPIO, 1); // LED on when page served
-    httpd_resp_send(req, HTML_PAGE, HTTPD_RESP_USE_STRLEN);
-    gpio_set_level(LED_GPIO, 0); // LED off
+    char page[512];
+    snprintf(page, sizeof(page), HTML_PAGE, led_state ? "ON" : "OFF");
+    httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// HTTP POST handler to toggle LED
+esp_err_t led_post_handler(httpd_req_t *req)
+{
+    led_state = !led_state; // toggle LED state
+    gpio_set_level(LED_GPIO, led_state ? 1 : 0);
+
+    // Redirect back to main page
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_send(req, NULL, 0);
+    ESP_LOGI(TAG, "LED toggled %s", led_state ? "ON" : "OFF");
     return ESP_OK;
 }
 
@@ -39,6 +58,13 @@ httpd_uri_t root = {
     .user_ctx = NULL
 };
 
+httpd_uri_t led_toggle = {
+    .uri = "/led",
+    .method = HTTP_POST,
+    .handler = led_post_handler,
+    .user_ctx = NULL
+};
+
 // Start HTTP server
 httpd_handle_t start_webserver(void)
 {
@@ -46,6 +72,7 @@ httpd_handle_t start_webserver(void)
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &root);
+        httpd_register_uri_handler(server, &led_toggle);
     }
     return server;
 }
@@ -60,6 +87,7 @@ void app_main(void)
     // Initialize LED
     gpio_reset_pin(LED_GPIO);
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO, 0);
 
     // Initialize Wi-Fi in AP mode
     esp_netif_create_default_wifi_ap();
