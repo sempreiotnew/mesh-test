@@ -1,162 +1,166 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_now.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
-#include "esp_netif.h"
 #include "nvs_flash.h"
-#include "esp_http_server.h"
 #include "driver/gpio.h"
 
+#define RED_GPIO       GPIO_NUM_27
+#define GREEN_GPIO     GPIO_NUM_26
+#define BLUE_GPIO      GPIO_NUM_25
+#define BUTTON_GPIO    GPIO_NUM_0
 
-extern const uint8_t index_html_start[] asm("_binary_index_html_start");
-extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
-extern const uint8_t index_js_start[]   asm("_binary_index_js_start");
-extern const uint8_t index_js_end[]     asm("_binary_index_js_end");
+static const char *TAG = "ESP_NOW_BTN_LED";
 
+/* ============================
+   CHANGE THIS MAC ADDRESS
+   Put the OTHER ESP32 MAC here
+   ============================ */
+//    30:AE:A4:84:7C:90 - amarela
+//.    00:4B:12:2D:F7:8C
 
-
-#define LED_GPIO GPIO_NUM_2
-#define BUTTON_GPIO GPIO_NUM_0
-static const char *TAG = "wifi_ap_web";
-
-static bool led_state = false; // LED off initially
-
-// HTTP GET handler (main page)
-esp_err_t root_get_handler(httpd_req_t *req) {
-    size_t len = index_html_end - index_html_start;
-    return httpd_resp_send(req, (const char *)index_html_start, len);
-}
-// HTTP POST handler to toggle LED via web
-// esp_err_t led_post_handler(httpd_req_t *req)
-// {
-//     led_state = !led_state;
-//     gpio_set_level(LED_GPIO, led_state ? 1 : 0);
-
-//     httpd_resp_set_status(req, "303 See Other");
-//     httpd_resp_set_hdr(req, "Location", "/");
-//     httpd_resp_send(req, NULL, 0);
-//     ESP_LOGI(TAG, "LED toggled %s via web", led_state ? "ON" : "OFF");
-//     return ESP_OK;
-// }
-
-esp_err_t led_post_handler(httpd_req_t *req)
-{
-    led_state = !led_state;
-    gpio_set_level(LED_GPIO, led_state ? 1 : 0);
-
-    httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
-    ESP_LOGI(TAG, "LED toggled %s via web", led_state ? "ON" : "OFF");
-    return ESP_OK;
-}
-
-
-// HTTP GET handler to return current LED state (for AJAX)
-esp_err_t led_state_get_handler(httpd_req_t *req)
-{
-    const char *state = led_state ? "ON" : "OFF";
-    httpd_resp_send(req, state, HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-}
-
-// URI registration
-httpd_uri_t root = {
-    .uri = "/",
-    .method = HTTP_GET,
-    .handler = root_get_handler,
-    .user_ctx = NULL
+//write to amarela
+static uint8_t peer_mac[] = {
+    0x00, 0x4B, 0x12, 0x2D, 0xF7, 0x8C
 };
 
-httpd_uri_t led_toggle = {
-    .uri = "/led",
-    .method = HTTP_POST,
-    .handler = led_post_handler,
-    .user_ctx = NULL
-};
+//write to normal
+// static uint8_t peer_mac[] = {
+//     0x30, 0xAE, 0xA4, 0x84, 0x7C, 0x90
+// };
 
-httpd_uri_t led_state_uri = {
-    .uri = "/led_state",
-    .method = HTTP_GET,
-    .handler = led_state_get_handler,
-    .user_ctx = NULL
-};
+/* Message format */
+typedef struct {
+    uint8_t toggle;
+} espnow_msg_t;
 
-// Start webserver
-httpd_handle_t start_webserver(void)
+/* ESP-NOW receive callback */
+static void espnow_recv_cb(const esp_now_recv_info_t *info,
+                           const uint8_t *data, int len)
 {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_register_uri_handler(server, &root);
-        httpd_register_uri_handler(server, &led_toggle);
-        httpd_register_uri_handler(server, &led_state_uri);
+    if (len != sizeof(espnow_msg_t)) return;
+
+    espnow_msg_t msg;
+    memcpy(&msg, data, sizeof(msg));
+
+    if (msg.toggle) {
+        gpio_set_level(RED_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gpio_set_level(RED_GPIO, 0);
+
+        gpio_set_level(GREEN_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gpio_set_level(GREEN_GPIO, 0);
+
+        gpio_set_level(BLUE_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gpio_set_level(BLUE_GPIO, 0);
+
+        ESP_LOGI(TAG, "RGB LED blinked by peer");
     }
-    return server;
 }
 
-// Button task
-void button_task(void *arg)
+/* Send toggle command */
+static void send_toggle(void)
 {
-    int last_button_state = 1; // not pressed
-    while (1) {
-        int button_state = gpio_get_level(BUTTON_GPIO);
+    espnow_msg_t msg = {
+        .toggle = 1
+    };
 
-        if (button_state == 0 && last_button_state == 1) { // falling edge
-            led_state = !led_state;
-            gpio_set_level(LED_GPIO, led_state ? 1 : 0);
-            ESP_LOGI(TAG, "Button pressed! LED is now %s", led_state ? "ON" : "OFF");
+    esp_err_t err = esp_now_send(peer_mac, (uint8_t *)&msg, sizeof(msg));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Toggle sent");
+    } else {
+        ESP_LOGE(TAG, "Send failed: %s", esp_err_to_name(err));
+    }
+}
+
+/* Button task */
+static void button_task(void *arg)
+{
+    bool last_state = true;
+
+    while (1) {
+        bool state = gpio_get_level(BUTTON_GPIO);
+
+        if (last_state && !state) {  // falling edge
+            vTaskDelay(pdMS_TO_TICKS(50)); // debounce
+            if (!gpio_get_level(BUTTON_GPIO)) {
+                send_toggle();
+            }
         }
 
-        last_button_state = button_state;
-        vTaskDelay(pdMS_TO_TICKS(50)); // debounce
+        last_state = state;
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-// Webserver task
-void webserver_task(void *arg)
+/* WiFi init for ESP-NOW */
+static void wifi_init(void)
 {
-    start_webserver();
-    vTaskDelete(NULL);
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+/* ESP-NOW init */
+static void espnow_init(void)
+{
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
+
+    esp_now_peer_info_t peer = {0};
+    memcpy(peer.peer_addr, peer_mac, 6);
+    peer.channel = 0;
+    peer.encrypt = false;
+
+    ESP_ERROR_CHECK(esp_now_add_peer(&peer));
 }
 
 void app_main(void)
 {
-    // NVS
     ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // LED init
-    gpio_reset_pin(LED_GPIO);
-    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_GPIO, 0);
-
-    // Button init
-    gpio_reset_pin(BUTTON_GPIO);
-    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY);
-
-    // Wi-Fi AP
-    esp_netif_create_default_wifi_ap();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    wifi_config_t wifi_config = {
-        .ap = {
-            .ssid = "ESP32_AP",
-            .ssid_len = strlen("ESP32_AP"),
-            .channel = 1,
-            .password = "12345678",
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_WPA_WPA2_PSK
-        },
+    /* GPIO setup */
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << RED_GPIO) |
+                        (1ULL << GREEN_GPIO) |
+                        (1ULL << BLUE_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
     };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "Wi-Fi AP started. Connect to SSID: %s", wifi_config.ap.ssid);
+    gpio_config(&io_conf);
 
-    // Tasks
-    xTaskCreate(webserver_task, "webserver_task", 4096, NULL, 5, NULL);
-    xTaskCreate(button_task, "button_task", 2048, NULL, 10, NULL);
+    io_conf.pin_bit_mask = (1ULL << BUTTON_GPIO);
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&io_conf);
+
+    gpio_set_level(RED_GPIO, 0);
+    gpio_set_level(GREEN_GPIO, 0);
+    gpio_set_level(BLUE_GPIO, 0);
+
+    /* WiFi + ESP-NOW */
+    wifi_init();
+    espnow_init();
+
+    /* Print MAC address */
+    uint8_t mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    ESP_LOGI(TAG, "My MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    /* Button task */
+    xTaskCreate(button_task, "button_task", 2048, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "ESP-NOW ready");
 }
