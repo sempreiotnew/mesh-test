@@ -1,166 +1,194 @@
 #include <string.h>
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "driver/gpio.h"
 #include "esp_now.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "nvs_flash.h"
-#include "driver/gpio.h"
 
-#define RED_GPIO       GPIO_NUM_27
-#define GREEN_GPIO     GPIO_NUM_26
-#define BLUE_GPIO      GPIO_NUM_25
-#define BUTTON_GPIO    GPIO_NUM_0
+#define TAG "GATEWAY"
 
-static const char *TAG = "ESP_NOW_BTN_LED";
+// Button
+#define BUTTON_GPIO GPIO_NUM_0
 
-/* ============================
-   CHANGE THIS MAC ADDRESS
-   Put the OTHER ESP32 MAC here
-   ============================ */
-//    30:AE:A4:84:7C:90 - amarela
-//.    00:4B:12:2D:F7:8C
+// Broadcast MAC for discovery
+static uint8_t broadcast_mac[ESP_NOW_ETH_ALEN] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-//write to amarela
-static uint8_t peer_mac[] = {
-    0x00, 0x4B, 0x12, 0x2D, 0xF7, 0x8C
-};
-
-//write to normal
-// static uint8_t peer_mac[] = {
-//     0x30, 0xAE, 0xA4, 0x84, 0x7C, 0x90
-// };
-
-/* Message format */
+// Node structure
 typedef struct {
-    uint8_t toggle;
-} espnow_msg_t;
+    uint8_t mac[ESP_NOW_ETH_ALEN];
+    uint8_t parent[ESP_NOW_ETH_ALEN];  // MAC of the node that sent its discovery
+    int layer; // distance from gateway
+} node_info_t;
 
-/* ESP-NOW receive callback */
-static void espnow_recv_cb(const esp_now_recv_info_t *info,
-                           const uint8_t *data, int len)
+#define MAX_NODES 20
+static node_info_t nodes[MAX_NODES];
+static int node_count = 0;
+
+// Semaphore for button press
+static SemaphoreHandle_t btn_sem;
+
+/* ================= Button ISR ================= */
+static void IRAM_ATTR button_isr(void *arg)
 {
-    if (len != sizeof(espnow_msg_t)) return;
-
-    espnow_msg_t msg;
-    memcpy(&msg, data, sizeof(msg));
-
-    if (msg.toggle) {
-        gpio_set_level(RED_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        gpio_set_level(RED_GPIO, 0);
-
-        gpio_set_level(GREEN_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        gpio_set_level(GREEN_GPIO, 0);
-
-        gpio_set_level(BLUE_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        gpio_set_level(BLUE_GPIO, 0);
-
-        ESP_LOGI(TAG, "RGB LED blinked by peer");
-    }
+    xSemaphoreGiveFromISR(btn_sem, NULL);
 }
 
-/* Send toggle command */
-static void send_toggle(void)
+/* ================= ESP-NOW RX ================= */
+static void espnow_rx_cb(const esp_now_recv_info_t *info,
+                         const uint8_t *data,
+                         int len)
 {
-    espnow_msg_t msg = {
-        .toggle = 1
-    };
+    if (len <= 0) return;
 
-    esp_err_t err = esp_now_send(peer_mac, (uint8_t *)&msg, sizeof(msg));
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Toggle sent");
-    } else {
-        ESP_LOGE(TAG, "Send failed: %s", esp_err_to_name(err));
-    }
-}
+    // Node announcing itself
+    if (len >= 4 && strncmp((char*)data, "HERE", 4) == 0) {
 
-/* Button task */
-static void button_task(void *arg)
-{
-    bool last_state = true;
-
-    while (1) {
-        bool state = gpio_get_level(BUTTON_GPIO);
-
-        if (last_state && !state) {  // falling edge
-            vTaskDelay(pdMS_TO_TICKS(50)); // debounce
-            if (!gpio_get_level(BUTTON_GPIO)) {
-                send_toggle();
+        bool exists = false;
+        for (int i = 0; i < node_count; i++) {
+            if (memcmp(nodes[i].mac, info->src_addr, 6) == 0) {
+                exists = true;
+                break;
             }
         }
 
-        last_state = state;
-        vTaskDelay(pdMS_TO_TICKS(10));
+        if (!exists && node_count < MAX_NODES) {
+            memcpy(nodes[node_count].mac, info->src_addr, 6);
+            memset(nodes[node_count].parent, 0, 6); // Root = gateway
+            nodes[node_count].layer = 1;            // Directly connected
+
+            // Add as peer so we can send BLINK
+            esp_now_peer_info_t peer = {0};
+            memcpy(peer.peer_addr, info->src_addr, 6);
+            peer.channel = 0;
+            peer.ifidx = WIFI_IF_STA;
+            peer.encrypt = false;
+
+            if (esp_now_add_peer(&peer) == ESP_OK) {
+                ESP_LOGI(TAG, "Node added as peer for BLINK!");
+                node_count++;
+            } else {
+                ESP_LOGW(TAG, "Failed to add node as peer for BLINK");
+            }
+
+            ESP_LOGI(TAG, "Node added to tree: %02X:%02X:%02X:%02X:%02X:%02X",
+                     info->src_addr[0], info->src_addr[1], info->src_addr[2],
+                     info->src_addr[3], info->src_addr[4], info->src_addr[5]);
+        }
     }
 }
 
-/* WiFi init for ESP-NOW */
-static void wifi_init(void)
+/* ================= Broadcast Discovery ================= */
+static void discovery_task(void *arg)
 {
+    const char *msg = "WHOIS";
+
+    // Add broadcast peer
+    esp_now_peer_info_t broadcast_peer = {0};
+    memcpy(broadcast_peer.peer_addr, broadcast_mac, ESP_NOW_ETH_ALEN);
+    broadcast_peer.channel = 0;
+    broadcast_peer.ifidx = WIFI_IF_STA;
+    broadcast_peer.encrypt = false;
+
+    if (esp_now_add_peer(&broadcast_peer) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to add broadcast peer (might exist already)");
+    }
+
+    while (1) {
+        esp_err_t err = esp_now_send(broadcast_mac, (uint8_t *)msg, strlen(msg));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to send discovery broadcast: %d", err);
+        } else {
+            ESP_LOGI(TAG, "BROADCAST - Sent : %s", msg);
+        }
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+}
+
+/* ================= Print Tree ================= */
+static void print_tree_task(void *arg)
+{
+    while(1) {
+        ESP_LOGI(TAG, "===== ESP-NOW TREE =====");
+        printf("Gateway (root)\n");
+
+        for (int i = 0; i < node_count; i++) {
+            for (int j = 0; j < nodes[i].layer; j++) printf("  "); // indent by layer
+            printf("|- Node: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                   nodes[i].mac[0], nodes[i].mac[1], nodes[i].mac[2],
+                   nodes[i].mac[3], nodes[i].mac[4], nodes[i].mac[5]);
+        }
+        printf("=====================\n\n");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+/* ================= Blink task (button-controlled) ================= */
+static void blink_task(void *arg)
+{
+    while (1) {
+        // Wait for button press
+        if (xSemaphoreTake(btn_sem, portMAX_DELAY)) {
+            if (node_count > 0) {
+                for (int i = 0; i < node_count; i++) {
+                    esp_err_t err = esp_now_send(nodes[i].mac, (uint8_t *)"BLINK", 5);
+                    if (err == ESP_OK) {
+                        ESP_LOGI(TAG, "Sent BLINK to node %02X:%02X:%02X:%02X:%02X:%02X",
+                                 nodes[i].mac[0], nodes[i].mac[1], nodes[i].mac[2],
+                                 nodes[i].mac[3], nodes[i].mac[4], nodes[i].mac[5]);
+                    } else {
+                        ESP_LOGW(TAG, "Failed to send BLINK to node %02X:%02X:%02X:%02X:%02X:%02X (%d)",
+                                 nodes[i].mac[0], nodes[i].mac[1], nodes[i].mac[2],
+                                 nodes[i].mac[3], nodes[i].mac[4], nodes[i].mac[5], err);
+                    }
+                }
+            } else {
+                ESP_LOGW(TAG, "No nodes in tree, cannot send BLINK");
+            }
+        }
+    }
+}
+
+/* ================= MAIN ================= */
+void app_main(void)
+{
+    // Button GPIO config
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,  // falling edge = pressed
+    };
+    gpio_config(&io_conf);
+
+    btn_sem = xSemaphoreCreateBinary();
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(BUTTON_GPIO, button_isr, NULL);
+
+    // Wi-Fi + ESP-NOW init
+    ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     esp_netif_create_default_wifi_sta();
-
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-}
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
-/* ESP-NOW init */
-static void espnow_init(void)
-{
     ESP_ERROR_CHECK(esp_now_init());
-    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_rx_cb));
 
-    esp_now_peer_info_t peer = {0};
-    memcpy(peer.peer_addr, peer_mac, 6);
-    peer.channel = 0;
-    peer.encrypt = false;
+    ESP_LOGI(TAG, "Gateway ready, broadcasting discovery messages...");
 
-    ESP_ERROR_CHECK(esp_now_add_peer(&peer));
-}
-
-void app_main(void)
-{
-    ESP_ERROR_CHECK(nvs_flash_init());
-
-    /* GPIO setup */
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << RED_GPIO) |
-                        (1ULL << GREEN_GPIO) |
-                        (1ULL << BLUE_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
-    };
-    gpio_config(&io_conf);
-
-    io_conf.pin_bit_mask = (1ULL << BUTTON_GPIO);
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-    gpio_config(&io_conf);
-
-    gpio_set_level(RED_GPIO, 0);
-    gpio_set_level(GREEN_GPIO, 0);
-    gpio_set_level(BLUE_GPIO, 0);
-
-    /* WiFi + ESP-NOW */
-    wifi_init();
-    espnow_init();
-
-    /* Print MAC address */
-    uint8_t mac[6];
-    esp_wifi_get_mac(WIFI_IF_STA, mac);
-    ESP_LOGI(TAG, "My MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-    /* Button task */
-    xTaskCreate(button_task, "button_task", 2048, NULL, 5, NULL);
-
-    ESP_LOGI(TAG, "ESP-NOW ready");
+    // Tasks
+    xTaskCreate(discovery_task, "discovery_task", 4096, NULL, 5, NULL);
+    xTaskCreate(print_tree_task, "print_tree", 4096, NULL, 4, NULL);
+    xTaskCreate(blink_task, "blink_task", 4096, NULL, 5, NULL);
 }
